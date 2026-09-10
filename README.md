@@ -10,7 +10,7 @@
 arXiv에서 논문을 찾아 한 편을 골라 답합니다.
 자율 2단계 에이전트 구조와 후속 질문 감지를 구현했습니다.
 
-## [scholarmind/](./scholarmind) — 2차 버전
+## [Scholarmind/](./Scholarmind) — 2차 버전
 
 논문 출처를 Semantic Scholar로 바꾸고 다음을 추가했습니다.
 
