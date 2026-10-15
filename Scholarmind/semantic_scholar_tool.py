@@ -1,17 +1,14 @@
 """
 semantic_scholar_tool.py
 ------------------------
-Semantic Scholar Academic Graph API wrapper for Ragxiv.
-
-Replaces arxiv_tool.py as the paper search and PDF acquisition layer.
-Public interface is identical to ArxivTool so rag_pipeline.py requires
-only a one-line import swap.
+Semantic Scholar Academic Graph API wrapper for ScholarMind —
+paper search and multi-source PDF acquisition.
 
 Rate limiting
 -------------
-S2 without a key: ~100 requests / 5 min (~3–4 s per request).
-All api.semanticscholar.org calls go through _s2_get(), which sleeps
-RATE_LIMIT_DELAY seconds before every request.
+All api.semanticscholar.org calls go through _s2_get(), which keeps at least
+RATE_LIMIT_DELAY (no key) / RATE_LIMIT_DELAY_KEYED (with key) seconds between
+consecutive requests.
 
 Non-S2 hosts (arXiv abstract backfill, Unpaywall, CORE, PDF downloads)
 go through _http_get(), which carries NO throttle.  arXiv volume is kept
@@ -53,7 +50,7 @@ _S2_BASE = "https://api.semanticscholar.org/graph/v1"
 _S2_FIELDS = (
     "paperId,title,abstract,authors,year,publicationDate,url,"
     "venue,publicationVenue,publicationTypes,citationCount,"
-    "influentialCitationCount,externalIds,openAccessPdf"
+    "influentialCitationCount,externalIds,openAccessPdf,tldr"
 )
 
 
@@ -77,8 +74,8 @@ class SemanticScholarTool:
     """
     Rate-limited wrapper around the Semantic Scholar Academic Graph API.
 
-    Exposes the same public interface as ArxivTool:
-        search(query, max_results, also_recent)  -> List[Dict]
+    Public interface:
+        search(query, max_results, backfill, year) -> List[Dict]
         download_pdf(paper)                      -> Optional[str]
         is_pdf_likely_available(paper)           -> bool
     """
@@ -112,8 +109,8 @@ class SemanticScholarTool:
         self,
         query: str,
         max_results: int = 10,
-        also_recent: bool = False,
         backfill: bool = True,
+        year: Optional[str] = None,
     ) -> List[Dict]:
         """
         Search Semantic Scholar for papers matching *query*.
@@ -126,9 +123,11 @@ class SemanticScholarTool:
         Args:
             query:        Plain-text relevance query (already refined by LLM).
             max_results:  Maximum number of papers to return.
-            also_recent:  When True, run a second S2 call sorted by
-                          publicationDate and merge results (deduped). Useful
-                          when relevance sort buries brand-new papers.
+            year:         S2 year filter, e.g. "2025-" (2025 onward) or
+                          "2023-2024". None = no filter. Used for recency
+                          intent ("최신 논문"). The /paper/search endpoint
+                          silently ignores sort=publicationDate, so a year
+                          filter is the only reliable way to get new papers.
             backfill:     When True (default), backfill missing abstracts from
                           arXiv and sort abstract-first before returning. Set
                           False for intermediate/exploratory calls (e.g. the
@@ -141,21 +140,9 @@ class SemanticScholarTool:
             from arXiv in a single batched Atom feed call where needed, and
             papers with non-empty abstracts are sorted first.
         """
-        logger.info("S2 search: '%s'", query[:80])
-        raw = self._s2_search(query, max_results, sort="relevance")
+        logger.info("S2 search: '%s'%s", query[:80], f" (year={year})" if year else "")
+        raw = self._s2_search(query, max_results, year=year)
         results = [self._paper_to_dict(r) for r in raw]
-        seen_ids = {p["id"] for p in results}
-
-        if also_recent:
-            logger.info("S2 recency pass for: '%s'", query[:80])
-            recent_raw = self._s2_search(
-                query, max(max_results // 2, 5), sort="date"
-            )
-            for r in recent_raw:
-                d = self._paper_to_dict(r)
-                if d["id"] not in seen_ids and len(results) < max_results:
-                    seen_ids.add(d["id"])
-                    results.append(d)
 
         if backfill:
             # Backfill missing abstracts via ONE batched arXiv Atom call (H)
@@ -287,7 +274,7 @@ class SemanticScholarTool:
     # ------------------------------------------------------------------
 
     def _s2_search(
-        self, query: str, limit: int, sort: str = "relevance"
+        self, query: str, limit: int, year: Optional[str] = None
     ) -> List[Dict]:
         """Issue one S2 paper/search request. Returns the raw JSON data list."""
         params: Dict = {
@@ -295,8 +282,8 @@ class SemanticScholarTool:
             "limit": min(limit, 100),
             "fields": _S2_FIELDS,
         }
-        if sort == "date":
-            params["sort"] = "publicationDate"
+        if year:
+            params["year"] = year
 
         max_attempts = 3
         for attempt in range(max_attempts):
@@ -340,7 +327,7 @@ class SemanticScholarTool:
     @staticmethod
     def _paper_to_dict(raw: Dict) -> Dict:
         """
-        Map a raw S2 API result to the Ragxiv paper dict schema.
+        Map a raw S2 API result to the ScholarMind paper dict schema.
 
         Pure mapper — no network calls. Abstract backfill is handled
         separately in _backfill_abstracts() after all papers are collected.
@@ -420,6 +407,9 @@ class SemanticScholarTool:
             "citation_count":        raw.get("citationCount") or 0,
             "influential_citations": raw.get("influentialCitationCount") or 0,
             "metadata_suspect":      metadata_suspect,
+            # S2가 만든 한 줄 요약(영어). 후보 목록에서 LLM 없이 논문을 고를 수 있게
+            # 보여준다. 실측: 검색 결과 10편 중 7편 정도에만 있다.
+            "tldr":                  ((raw.get("tldr") or {}).get("text") or "").strip(),
         }
 
     # ------------------------------------------------------------------
@@ -483,7 +473,7 @@ class SemanticScholarTool:
         try:
             resp = self._http_get(
                 url,
-                headers={"User-Agent": "Ragxiv/1.0 (research assistant)"},
+                headers={"User-Agent": "ScholarMind/1.0 (research assistant)"},
                 timeout=PDF_DOWNLOAD_TIMEOUT,
                 allow_redirects=True,
             )
@@ -500,7 +490,7 @@ class SemanticScholarTool:
         try:
             resp = self._http_get(
                 url,
-                headers={"User-Agent": "Ragxiv/1.0 (research assistant)"},
+                headers={"User-Agent": "ScholarMind/1.0 (research assistant)"},
                 timeout=PDF_DOWNLOAD_TIMEOUT,
                 allow_redirects=True,
             )
@@ -531,7 +521,7 @@ class SemanticScholarTool:
                 return None
             resp = self._http_get(
                 pdf_url,
-                headers={"User-Agent": "Ragxiv/1.0 (research assistant)"},
+                headers={"User-Agent": "ScholarMind/1.0 (research assistant)"},
                 timeout=PDF_DOWNLOAD_TIMEOUT,
                 allow_redirects=True,
             )
@@ -566,7 +556,7 @@ class SemanticScholarTool:
                 return None
             resp = self._http_get(
                 pdf_url,
-                headers={"User-Agent": "Ragxiv/1.0 (research assistant)"},
+                headers={"User-Agent": "ScholarMind/1.0 (research assistant)"},
                 timeout=PDF_DOWNLOAD_TIMEOUT,
                 allow_redirects=True,
             )
@@ -599,11 +589,19 @@ class SemanticScholarTool:
     def _s2_get(self, url: str, **kwargs) -> requests.Response:
         """
         Rate-limited GET for api.semanticscholar.org endpoints only.
-        Sleeps self._rate_delay seconds before every call
-        (키 유무에 따라 3.0s 또는 1.1s — __init__ 참조).
+
+        직전 S2 호출 이후 self._rate_delay초(키 유무에 따라 3.0s 또는 1.1s)가 지나도록
+        남은 시간만 기다린다. 예전에는 매 호출 전에 무조건 기다려서, 질문 사이에
+        LLM이 수십 초를 쓴 뒤의 첫 검색에도 불필요하게 1~3초를 쉬었다.
         """
-        time.sleep(self._rate_delay)
-        return requests.get(url, headers=self._s2_headers, **kwargs)
+        last = getattr(self, "_last_s2_call", 0.0)
+        wait = self._rate_delay - (time.monotonic() - last)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            return requests.get(url, headers=self._s2_headers, **kwargs)
+        finally:
+            self._last_s2_call = time.monotonic()
 
     def _http_get(self, url: str, **kwargs) -> requests.Response:
         """
