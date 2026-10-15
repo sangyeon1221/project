@@ -1,7 +1,7 @@
 """
 pdf_extractor.py
 ----------------
-PDF text extraction and Unicode noise filtering for Ragxiv.
+PDF text extraction and Unicode noise filtering for ScholarMind.
 
 Two cleaners are exposed at different strictness levels:
 
@@ -28,7 +28,7 @@ Two cleaners are exposed at different strictness levels:
 
 import logging
 import re
-from typing import Optional
+import unicodedata
 
 import fitz  # PyMuPDF
 
@@ -110,6 +110,17 @@ _LLM_NOISE = re.compile(
 # We detect runs of combining marks preceded by a space or Korean syllable.
 _ORPHAN_COMBINING = re.compile(r"(?<=[ 가-힣])[̀-ͯ]+")
 
+# 합자(ﬁ ﬂ ﬀ ﬃ)와 수학용 이탤릭 문자(𝑡 𝑢 𝑐)는 허용 목록 밖이라 공백으로 바뀌고
+# 있었다. 실측: 캐시된 논문 40편 중 28편에서 합자만 약 1,500곳 — "efficient"가
+# "e cient", "classification"이 "classi cation"이 되어 BM25 정확 매치와 LLM 읽기를
+# 모두 망쳤다. 이 두 범위만 NFKC로 풀어 쓴다. 전체 NFKC는 "10²"를 "102"로 바꾸는 등
+# 수치를 왜곡하므로 쓰지 않는다.
+_COMPAT_LETTERS = re.compile(r"[ﬀ-ﬆ\U0001d400-\U0001d7ff]")
+
+
+def _expand_compat_letters(text: str) -> str:
+    return _COMPAT_LETTERS.sub(lambda m: unicodedata.normalize("NFKC", m.group(0)), text)
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -131,6 +142,9 @@ def clean_pdf_text(text: str) -> str:
     Returns:
         Cleaned string with noise characters replaced by spaces.
     """
+    # 0. 합자·수학용 문자를 일반 글자로 (허용 목록 밖이라 지워지기 전에)
+    text = _expand_compat_letters(text)
+
     # 1. Strip orphaned combining marks (Vietnamese tone noise)
     text = _ORPHAN_COMBINING.sub("", text)
 
