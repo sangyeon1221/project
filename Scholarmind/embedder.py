@@ -4,7 +4,7 @@ embedder.py
 Thin wrapper around intfloat/multilingual-e5-small (384 dims).
 
 multilingual-e5-small aligns Korean queries and English passages in a shared
-embedding space, which is critical for Ragxiv: user queries arrive in Korean
+embedding space, which is critical for ScholarMind: user queries arrive in Korean
 while paper chunks are English text. BGE-small-en was English-only and produced
 poor cross-lingual retrieval for Korean queries.
 
@@ -48,7 +48,15 @@ class Embedder:
 
     def __init__(self) -> None:
         logger.info("Loading embedding model: %s", MODEL_NAME)
-        self._model = SentenceTransformer(MODEL_NAME)
+        # 이미 받아둔 모델이 있으면 Hugging Face 서버에 업데이트 확인을 하지 않는다.
+        # 확인 요청이 매 실행마다 나가서 로드가 9초 → 3.7초로 줄고, 와이파이가
+        # 나쁜 환경에서 이 요청이 지연되는 문제도 사라진다. 캐시에 없을 때(첫 실행)만
+        # 다운로드한다.
+        try:
+            self._model = SentenceTransformer(MODEL_NAME, local_files_only=True)
+        except Exception:
+            logger.info("로컬 캐시에 모델이 없어 다운로드합니다: %s", MODEL_NAME)
+            self._model = SentenceTransformer(MODEL_NAME)
         logger.info("Embedding model ready (dim=%d)", EMBEDDING_DIM)
 
     # ------------------------------------------------------------------
