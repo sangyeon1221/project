@@ -10,9 +10,9 @@ exact matches on acronyms, math symbols, and proper nouns that appear
 verbatim in the query.  RRF(k=60) combines both rank lists without requiring
 score normalisation.
 
-For Korean queries against English chunks, BM25 contributes little (token
-overlap is low) and dense dominates — RRF degrades gracefully in this case.
-BM25 gains influence when the query contains English technical terms.
+Korean queries share no tokens with English chunks, so rag_pipeline passes
+the paper's English search keywords along with the query (_bm25_text) —
+otherwise BM25 would contribute nothing for Korean questions.
 """
 
 import logging
