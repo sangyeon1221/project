@@ -1,0 +1,23 @@
+# 논문 PDF — 저작권 자료이므로 저장소에 포함하지 않음
+pdfs/
+
+# 실행 중 생성되는 캐시
+cache/
+__pycache__/
+*.py[cod]
+
+# 단계별 시간 기록 (timing.py) — 내 PC의 측정값
+logs/
+
+# 검증 리포트 — 샘플 하나만 남기고 제외
+eval/results/*
+!eval/results/sample.md
+
+# 환경 변수 (API 키)
+.env
+
+# OS / 에디터
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

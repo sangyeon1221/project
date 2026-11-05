@@ -46,7 +46,9 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-OLLAMA_BASE_URL: str = "http://localhost:11434"
+# localhost가 아니라 127.0.0.1 — Windows에서 localhost는 IPv6(::1)를 먼저 시도하다
+# 실패한 뒤 IPv4로 넘어가서 요청마다 2.15초가 더 걸렸다(127.0.0.1은 0.12초).
+OLLAMA_BASE_URL: str = "http://127.0.0.1:11434"
 MODEL_NAME: str = "exaone3.5:2.4b"
 TEMPERATURE: float = 0.05   # default for utility calls (refine / select / classify)
 OLLAMA_TIMEOUT: int = 300   # seconds — conservative for 2.4B on CPU (~5 tok/s)

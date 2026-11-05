@@ -41,6 +41,7 @@ from semantic_scholar_tool import RATE_LIMIT_DELAY, RATE_LIMIT_DELAY_KEYED, S2Ra
 from embedder import Embedder
 from pdf_extractor import clean_llm_output
 from llm_client import normalize_bullets, strip_answer_echo
+from timing import StageTimer
 
 logging.basicConfig(level=logging.INFO)
 
@@ -321,8 +322,27 @@ def _render_candidate_panel() -> None:
             )
 
 
+def _timed(stream, timer: StageTimer):
+    """첫 글자가 나오는 순간을 기록한다 — 그때까지가 근거 검색과 프롬프트 읽기 시간이다."""
+    first = True
+    for piece in stream:
+        if first:
+            timer.lap("근거 검색 · 첫 글자")
+            first = False
+        yield piece
+
+
+def _show_timing(timer: StageTimer, question: str) -> str:
+    """단계별 시간표를 답변 아래에 보여주고 logs/timings.jsonl에 남긴다. 기록용 표를 돌려준다."""
+    table = timer.markdown()
+    with st.expander(f"⏱ 단계별 소요 시간 · 총 {timer.total:.1f}초"):
+        st.markdown(table)
+    timer.save(question)
+    return table
+
+
 def _render_answer(pipeline: RAGPipeline, question: str, paper: dict, lang: str,
-                   weak_match: bool = False) -> str:
+                   weak_match: bool = False, timer: StageTimer = None) -> str:
     """
     답변을 스트리밍으로 보여주고 후처리·경고·출처 카드를 붙인다.
     새 검색, 후속 질문, '다시 답하기'가 모두 이 함수를 쓴다.
@@ -346,7 +366,8 @@ def _render_answer(pipeline: RAGPipeline, question: str, paper: dict, lang: str,
     # 스트리밍이 끝난 뒤 후처리로 바뀐 게 있으면 같은 자리(answer_slot)에 다시 그린다.
     answer_slot = st.empty()
     with answer_slot:
-        full_answer = st.write_stream(pipeline.stream_answer(question, paper, lang))
+        stream = pipeline.stream_answer(question, paper, lang)
+        full_answer = st.write_stream(_timed(stream, timer) if timer else stream)
     if isinstance(full_answer, str) and full_answer.strip():
         # 스트리밍 경로도 일반 경로와 같은 후처리를 거친다(번호 목록 → 불릿,
         # 앞머리에 따라 쓴 "[최종 답변]:" 제거, 중복 줄 제거).
@@ -366,6 +387,8 @@ def _render_answer(pipeline: RAGPipeline, question: str, paper: dict, lang: str,
             )
         st.markdown(full_answer)
     full_answer = normalize_bullets(clean_llm_output(full_answer))
+    if timer:
+        timer.lap("답변 출력")
 
     # 답변의 "X% 향상/감소"가 원문에서는 오류율 같은 지표 값 자체인 경우 경고한다.
     # (소형 모델이 "gains over the state of the art: 21.2% top-1 error"를
@@ -418,6 +441,9 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
         # 지난 검색의 후보 목록은 접어서 보여준다. 가장 최근 검색의 목록은
         # 아래 패널(버튼 포함)에 있으므로 여기서는 생략한다.
+        if msg.get("timing_md"):
+            with st.expander("⏱ 단계별 소요 시간"):
+                st.markdown(msg["timing_md"])
         if msg.get("candidates_md") and msg.get("candidates_id") != _live_cands:
             with st.expander("이때 검색된 후보 논문"):
                 st.markdown(msg["candidates_md"])
@@ -451,6 +477,7 @@ if _switch_to and st.session_state.get("candidates"):
     cands = st.session_state.candidates
     paper = next((p for p in cands["papers"] if p.get("id") == _switch_to), None)
     if paper:
+        timer = StageTimer("다시 답하기")
         pipeline = _get_pipeline()
         question, lang = cands["question"], cands["lang"]
         request = f"↻ **{paper['title']}** 논문으로 다시 답해줘 — \"{question}\""
@@ -461,6 +488,7 @@ if _switch_to and st.session_state.get("candidates"):
             with st.status("선택한 논문을 읽는 중...", expanded=True) as status:
                 st.write("📥 PDF를 받아 인덱싱합니다...")
                 n_chunks = pipeline.switch_paper(paper)
+                timer.lap("PDF·인덱싱")
                 if n_chunks == 0:
                     status.update(label="PDF를 받지 못했습니다", state="error")
                     fail = ("이 논문의 PDF를 받지 못했습니다. 원래 논문은 그대로 유지되니, "
@@ -470,14 +498,17 @@ if _switch_to and st.session_state.get("candidates"):
                     st.stop()
                 st.write(f"→ Indexed **{n_chunks:,}** chunks into FAISS.")
                 status.update(label="Ready to answer...", state="complete")
-            content = _render_answer(pipeline, question, paper, lang)
+            content = _render_answer(pipeline, question, paper, lang, timer=timer)
+            timing_md = _show_timing(timer, question)
         cands["current_id"] = paper.get("id")
-        st.session_state.messages.append({"role": "assistant", "content": content})
+        st.session_state.messages.append(
+            {"role": "assistant", "content": content, "timing_md": timing_md})
 
 # ---------------------------------------------------------------------------
 # 새 질문
 # ---------------------------------------------------------------------------
 if user_input:
+    timer = StageTimer("새 검색")
     # Display user message
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
@@ -501,6 +532,9 @@ if user_input:
         # Semantic Scholar search + PDF download pipeline.
         # ----------------------------------------------------------------
         followup = pipeline.is_followup(user_input)
+        timer.lap("질문 판별")
+        if followup:
+            timer.kind = "후속 질문"
 
         if followup:
             # Follow-up path — reuse existing FAISS index
@@ -546,6 +580,7 @@ if user_input:
                 # Step 1a: Query refinement
                 st.write("🔍 **Step 1** — Refining query into search keywords...")
                 keywords = pipeline.refine_query(user_input)
+                timer.lap("검색어 생성")
                 st.write(f"→ Keywords: `{keywords}`")
                 recency_filter = pipeline.search_year
                 if recency_filter and pipeline.wants_newest:
@@ -560,6 +595,7 @@ if user_input:
                 st.write(f"📄 Searching Semantic Scholar (rate limit: {_S2_DELAY:g} s/request)...")
                 try:
                     papers, effective_kw = pipeline.search_papers(keywords, max_results=10)
+                    timer.lap("논문 검색")
                 except S2RateLimitError:
                     # 429는 "결과 없음"이 아니라 API 차단 — 질문을 바꾸라고 안내하면 안 된다.
                     status.update(label="API 요청 한도 초과", state="error")
@@ -604,6 +640,7 @@ if user_input:
                 # Step 2a: Paper selection
                 st.write("🧠 **Step 2** — LLM is analysing abstracts...")
                 selected_paper, reasoning = pipeline.select_paper(user_input, papers)
+                timer.lap("논문 선택")
                 title_short = (
                     selected_paper["title"][:80] + "..."
                     if len(selected_paper["title"]) > 80
@@ -618,6 +655,7 @@ if user_input:
                 indexed_paper, n_chunks, substituted = pipeline.index_with_fallback(
                     papers, selected_paper, query=user_input
                 )
+                timer.lap("PDF·인덱싱")
 
                 if n_chunks == 0:
                     status.update(label="PDF indexing failed", state="error")
@@ -645,9 +683,10 @@ if user_input:
                 st.write(f"→ Indexed **{n_chunks:,}** chunks into FAISS.")
                 status.update(label="Ready to answer...", state="complete")
 
-        content = _render_answer(pipeline, user_input, selected_paper, lang, weak_match)
+        content = _render_answer(pipeline, user_input, selected_paper, lang, weak_match, timer)
+        timing_md = _show_timing(timer, user_input)
 
-    message = {"role": "assistant", "content": content}
+    message = {"role": "assistant", "content": content, "timing_md": timing_md}
     if papers:
         # 새로 검색한 경우 — 후보 목록을 패널(버튼)과 대화 기록(텍스트) 양쪽에 남긴다.
         # 후보 목록이 요청 자체에 대한 답인 "논문 찾아줘"·최신 요청이면 펼쳐서 보여준다.
