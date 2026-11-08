@@ -6,6 +6,10 @@
 
 ![질문 "MCP가 뭐야?"에 대한 답변과 출처](Scholarmind/docs/answer.png)
 
+## 시연 영상
+
+https://github.com/user-attachments/assets/39935e8a-126a-4f46-ad60-8164a97344bf
+
 **[발표 자료 (PDF, 19쪽)](Scholarmind/docs/presentation.pdf)**
 
 ## 주요 결과
