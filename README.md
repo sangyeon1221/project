@@ -6,6 +6,8 @@
 
 ![질문 "MCP가 뭐야?"에 대한 답변과 출처](Scholarmind/docs/answer.png)
 
+**[발표 자료 (PDF, 19쪽)](Scholarmind/docs/presentation.pdf)**
+
 ## 주요 결과
 
 | 항목 | 결과 |
