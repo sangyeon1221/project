@@ -21,6 +21,7 @@ ScholarMind 시스템 상태 점검. 사람의 입력 없이 한 번 실행으�
 
 import logging
 import os
+os.environ.setdefault("S2_SEARCH_CACHE", "0")   # 검색 결과 저장본 끄기
 import re
 import shutil
 import socket
@@ -871,7 +872,7 @@ def check_metric_misread() -> Result:
         return False, f"올바른 수치 표현을 오류로 잡음: {over}"
 
     class FakeLLM:
-        def stream_rag_response(self, q, chunks, paper, lang):
+        def stream_rag_response(self, q, chunks, paper, lang, **kw):
             yield "- 기존 대비 21.2% 향상된 top-1 오류율을 달성했습니다."
 
     pipe = RAGPipeline.__new__(RAGPipeline)
@@ -1168,7 +1169,7 @@ def check_bullet_dedup() -> Result:
 
     # 배선: generate_answer가 dedup을 거치는가
     class FakeLLM:
-        def generate_rag_response(self, q, chunks, paper, lang):
+        def generate_rag_response(self, q, chunks, paper, lang, **kw):
             return "", "- 데이터 품질이 성능에 중요합니다.\n- 데이터 품질이 성능에 중요하다고 합니다."
 
     pipe._llm = FakeLLM()
@@ -1309,7 +1310,7 @@ def check_pdf_fallback() -> Result:
         return False, f"대체 실패: {got2}, {n2}, {sub2}, {degraded.tried}"
 
     dead = Pipe({p["id"] for p in papers})
-    got3, n3, _ = dead.index_with_fallback(papers, papers[0])
+    got3, n3, _ = dead.index_with_fallback(papers, papers[0], max_attempts=3)   # 상한이 지켜지는지
     if got3 is not None or n3 != 0 or len(dead.tried) != 3:
         return False, f"전멸 케이스 이상: {got3}, {n3}, {dead.tried}"
     return True, "정상/대체/전멸 3케이스 모두 기대대로"

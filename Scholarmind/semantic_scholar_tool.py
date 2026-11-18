@@ -27,6 +27,8 @@ UNPAYWALL_EMAIL  (optional) — enables Unpaywall step in PDF cascade and
 CORE_API_KEY     (optional) — enables CORE step in PDF cascade.
 """
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -141,7 +143,7 @@ class SemanticScholarTool:
             papers with non-empty abstracts are sorted first.
         """
         logger.info("S2 search: '%s'%s", query[:80], f" (year={year})" if year else "")
-        raw = self._s2_search(query, max_results, year=year)
+        raw = self._cached_s2_search(query, max_results, year=year)
         results = [self._paper_to_dict(r) for r in raw]
 
         if backfill:
@@ -273,6 +275,44 @@ class SemanticScholarTool:
     # Internal — S2 API calls
     # ------------------------------------------------------------------
 
+    # 검색 결과 저장 — 같은 검색어는 하루 동안 API를 다시 부르지 않는다.
+    # 키가 있어도 한도는 초당 1회라 연속 질문·시연에서 429가 잦았다(실측: 연속 3회 중 2회 429).
+    # 429로 끝내 실패하면, 오래된 저장본이라도 있으면 그것을 쓴다.
+    # 점검 스크립트는 S2_SEARCH_CACHE=0으로 끈다(검색 함수 고장 주입이 저장본에 가려지지 않게).
+    SEARCH_CACHE_DIR = os.path.join(".", "cache", "s2_search")
+    SEARCH_CACHE_TTL = 24 * 3600
+
+    def _cached_s2_search(self, query: str, limit: int, year: Optional[str] = None) -> List[Dict]:
+        if os.environ.get("S2_SEARCH_CACHE", "1") == "0":
+            return self._s2_search(query, limit, year=year)
+        key = hashlib.sha1(f"{query}|{limit}|{year}".encode("utf-8")).hexdigest()[:16]
+        path = os.path.join(self.SEARCH_CACHE_DIR, f"{key}.json")
+        fresh = os.path.exists(path) and time.time() - os.path.getmtime(path) < self.SEARCH_CACHE_TTL
+        if fresh and (cached := self._read_search_cache(path)) is not None:
+            logger.info("S2 search cache hit: %r", query)
+            return cached
+        try:
+            data = self._s2_search(query, limit, year=year)
+        except S2RateLimitError:
+            if (cached := self._read_search_cache(path)) is not None:
+                logger.warning("S2 429 — 저장해 둔 검색 결과로 대신함: %r", query)
+                return cached
+            raise
+        if data:
+            os.makedirs(self.SEARCH_CACHE_DIR, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+        return data
+
+    @staticmethod
+    def _read_search_cache(path: str) -> Optional[List[Dict]]:
+        """저장본 읽기 — 없거나 깨졌으면(저장 중 종료 등) None, 그럼 다시 검색한다."""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
     def _s2_search(
         self, query: str, limit: int, year: Optional[str] = None
     ) -> List[Dict]:
@@ -285,7 +325,8 @@ class SemanticScholarTool:
         if year:
             params["year"] = year
 
-        max_attempts = 3
+        # 키가 있어도 한도는 초당 1회 — 1.1·2.2·4.4·8.8초 쉬며 최대 5번(약 16초) 시도
+        max_attempts = 5
         for attempt in range(max_attempts):
             try:
                 resp = self._s2_get(

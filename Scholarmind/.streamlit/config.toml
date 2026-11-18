@@ -1,0 +1,36 @@
+[server]
+# static/ 폴더의 Pretendard 글꼴을 인터넷 없이 내보낸다
+enableStaticServing = true
+
+[client]
+toolbarMode = "minimal"
+
+# 시안 A — 따뜻한 흰 바탕 + 주황빨강 강조 하나 + 회색
+[theme]
+base = "light"
+primaryColor = "#E8553D"
+backgroundColor = "#FBFAF8"
+secondaryBackgroundColor = "#F3F1ED"
+textColor = "#1F1D1B"
+font = "Pretendard"
+headingFont = "Pretendard"
+baseRadius = "medium"
+borderColor = "#EBE7E1"
+
+[[theme.fontFaces]]
+family = "Pretendard"
+url = "app/static/Pretendard-Medium.woff2"
+weight = 400
+
+[[theme.fontFaces]]
+family = "Pretendard"
+url = "app/static/Pretendard-SemiBold.woff2"
+weight = 600
+
+[[theme.fontFaces]]
+family = "Pretendard"
+url = "app/static/Pretendard-Bold.woff2"
+weight = 700
+
+[theme.sidebar]
+backgroundColor = "#F3F1ED"

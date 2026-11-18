@@ -37,6 +37,8 @@ def _tokenize(text: str) -> List[str]:
     return [t.lower() for t in _TOKEN.findall(text)]
 
 
+_TOC_LEADER = re.compile(r"\.{5,}\s*\d")
+
 class VectorStore:
     """
     Ephemeral hybrid index (FAISS dense + BM25 lexical) for a single paper.
@@ -152,6 +154,35 @@ class VectorStore:
             for i, s in top
         ]
 
+    @staticmethod
+    def _is_toc(text: str) -> bool:
+        """목차 청크인가 — '1.2. Introduction ........ 3'처럼 점선 줄이 3개 이상.
+        (관찰: 요약 근거 5개 중 2개가 목차였고, 한계 질문에도 목차 속 'Future Research' 제목이 뽑힘)"""
+        return len(_TOC_LEADER.findall(text)) >= 3
+
+    def keyword_chunks(self, pattern, n: int = 3, bonus=None) -> List[Dict]:
+        """
+        정규식 *pattern*이 많이 나오는 청크 *n*개를 문서 순서대로 반환 (없으면 빈 리스트).
+        *bonus*에 맞는 청크(예: 'Limitations' 절 제목)는 점수를 더 준다.
+        """
+        scored = []
+        for i, text in enumerate(self._chunks):
+            if self._is_toc(text):
+                continue
+            hits = len(pattern.findall(text))
+            if not hits:
+                continue
+            if bonus is not None and bonus.search(text):
+                hits += 3
+            scored.append((hits, i))
+        top = [i for _, i in sorted(scored, reverse=True)[:n]]
+        # 절 제목이 청크 끝에 걸리면 본문은 다음 청크에 있다(관찰: 7장 제목만 근거로 들어가
+        # 모델이 사례 설명을 한계로 바꿔 씀). 제목 청크는 다음 청크도 함께 넣는다(최대 n+1개).
+        nxt = [i + 1 for i in top if bonus is not None and bonus.search(self._chunks[i])
+               and i + 1 < len(self._chunks) and i + 1 not in top]
+        top = sorted(top + nxt[:1])
+        return [{"chunk": self._chunks[i], "metadata": self._metadata[i], "score": 1.0} for i in top]
+
     def head_chunks(self, n: int = 3) -> List[Dict]:
         """
         문서 앞부분에서 *n*개 청크를 문서 순서 그대로 반환.
@@ -163,9 +194,12 @@ class VectorStore:
         Returns:
             List of dicts with keys: chunk, metadata, score (score는 항상 1.0).
         """
+        idx = [i for i, t in enumerate(self._chunks) if not self._is_toc(t)][:n]
+        if not idx:   # 전부 목차로 보이는 비정상 상황이면 앞부분 그대로
+            idx = list(range(min(n, len(self._chunks))))
         return [
             {"chunk": self._chunks[i], "metadata": self._metadata[i], "score": 1.0}
-            for i in range(min(n, len(self._chunks)))
+            for i in idx
         ]
 
     def reset(self) -> None:

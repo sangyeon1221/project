@@ -35,7 +35,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from semantic_scholar_tool import SemanticScholarTool, S2RateLimitError
+from semantic_scholar_tool import SemanticScholarTool
 from embedder import Embedder
 from llm_client import LLMClient, fix_decimal_colons
 from pdf_extractor import extract_text as extract_pdf_text
@@ -50,9 +50,32 @@ CHUNK_SIZE: int = 1000       # characters
 CHUNK_OVERLAP: int = 150     # characters
 TOP_K: int = 5         # 내장 그래픽 가속으로 읽기가 5배 빨라져 3 → 5로 다시 늘림 (근거 확대)
 CANDIDATE_K: int = 20  # 밀집·BM25 각 순위에서 융합에 넣을 후보 수
+TOP_K_SIMPLE: int = 3  # 짧고 단순한 질문은 근거 3개로 충분 (계획서: 단순 k=3, 복잡 k=5)
+_COMPLEX_KW: tuple = (
+    "비교", "차이", "어떻게", "왜", "장단점", "한계", "방법", "과정", "원리", "구조",
+    "compare", "difference", "how", "why", "limitation", "method", "pros", "cons",
+)
+
+
+def _top_k_for(query: str) -> int:
+    """질문 난이도에 따라 근거 문단 수를 정한다 — 길거나 비교·이유·방법을 묻는 질문은 5개."""
+    q = query.strip().lower()
+    if len(q) >= 30 or any(k in q for k in _COMPLEX_KW):
+        return TOP_K
+    return TOP_K_SIMPLE
 
 # Sentence splitter for context compression (Part 3)
-_SENT = re.compile(r"(?<=[.!?。])\s+|\n+")
+# PDF 글은 줄마다 \n이 있어서 \n에서 자르면 문장이 줄 조각이 되고, 조각끼리 붙어
+# "boilerplate levels of precision" 같은 가짜 문장이 생겼다(관찰). 줄은 잇고 문장부호·빈 줄에서만 자른다.
+_SENT = re.compile(r"(?<=[.!?。])\s+|\n\n+")
+
+
+def _sentences(text: str) -> List[str]:
+    text = re.sub(r"(?<=[a-z])-\n\s*(?=[a-z])", "", text)   # 줄 끝 하이픈: knowl-\nedge → knowledge
+    text = re.sub(r"\n[ \t]*\n\s*", "\n\n", text)           # 빈 줄(공백 포함) → 문단 경계
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)            # 한 줄 바꿈 → 공백
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return [s.strip() for s in _SENT.split(text) if len(s.strip()) > 15]
 
 # 요약형 질의 감지 — "요약해줘" 같은 질문은 논문 내용과 의미적으로 무관해서
 # 벡터 유사도 검색이 사실상 무작위 청크를 반환한다(관찰된 사례: 부록의 실험
@@ -81,9 +104,17 @@ _BIB_VENUE = re.compile(r"\barXiv\b|\bProceedings\b|\bpp\.\s*\d|\bdoi\b", re.IGN
 BIB_THRESHOLD: int = 8   # 보정 결과: 참고문헌 22/23 검출, 본문·부록 137개 중 오탐 1
 
 
+_BIB_URL = re.compile(r"https?://|\burl:", re.IGNORECASE)
+
+
 def _looks_like_bibliography(chunk: str) -> bool:
     score = (len(_BIB_AUTHOR.findall(chunk)) + len(_BIB_YEAR.findall(chunk))
              + len(_BIB_INDEX.findall(chunk)) + len(_BIB_VENUE.findall(chunk)))
+    # 웹 문서 참고문헌("[35] Spheron Network.…2025.url:https://…")은 위 형식에 덜 걸려 놓쳤다(관찰).
+    # URL은 이미 참고문헌 티가 나고(4점 이상) 3개 이상일 때만 센다 — 코드 링크 표·DOI 머리말·각주 오탐 방지.
+    urls = len(_BIB_URL.findall(chunk))
+    if score >= 4 and urls >= 3:
+        score += urls
     return score >= BIB_THRESHOLD
 
 
@@ -96,20 +127,48 @@ def _looks_like_bibliography(chunk: str) -> bool:
 # 일반 단어와 구별하기 위해 대문자로 쓴 것만 잡는다.
 _ACRONYM_KO = re.compile(r"(?<![A-Za-z])[A-Za-z][A-Za-z0-9]{1,3}(?![A-Za-z])")
 _ACRONYM_EN = re.compile(r"(?<![A-Za-z])[A-Z][A-Z0-9]{1,5}(?![A-Za-z])")
-_ACRONYM_SKIP = frozenset({"ai", "and", "or", "the", "of", "vs", "in", "on", "to"})
+# llm·nlp 같은 흔한 약어는 키워드 모델이 잘 알아서 되살릴 필요가 없다. 되살리면 "LLM AI"라는
+# 넓은 구문이 첫 검색을 차지해 후보를 다 채운다(관찰: "멀티모달 LLM 환각" → Llama Guard).
+_ACRONYM_SKIP = frozenset({"ai", "and", "or", "the", "of", "vs", "in", "on", "to",
+                           "llm", "llms", "nlp", "ml", "dl", "gpt"})
+# 한글로 쓴 AI 용어 — 키워드 모델이 빠뜨리면 영어로 되살린다(관찰: "에이전틱 AI 동향" → "AGI development")
+_KO_TERMS = {"에이전틱": "agentic", "에이전트": "agent", "멀티모달": "multimodal", "온디바이스": "on-device",
+             "트랜스포머": "transformer", "파인튜닝": "fine-tuning", "프롬프트": "prompt", "임베딩": "embedding",
+             "디퓨전": "diffusion", "파운데이션 모델": "foundation model"}
+
+
+# 영어 용어 보존 — 한국어 질문 속 영어 용어("Agentic ai")를 LLM이 다른 말
+# ("Agent-Based AI")로 바꾸면 검색이 빗나간다(관찰: 노트북·데스크톱 모두 동일).
+# 약어가 아닌 영어 용어도 키워드에서 사라졌으면 사용자가 쓴 그대로 되살린다.
+_EN_TERM = re.compile(r"[A-Za-z][A-Za-z0-9\-]*(?:\s+[A-Za-z][A-Za-z0-9\-]*)*")
+
+
+def _english_terms(query: str) -> List[str]:
+    terms = []
+    for t in _EN_TERM.findall(query):
+        words = t.split()
+        if len(words) == 1 and len(t) < 5:      # 짧은 한 단어는 약어 규칙이 맡는다
+            continue
+        terms.append(" ".join("AI" if w.lower() == "ai" else w for w in words))
+    return list(dict.fromkeys(terms))
 
 
 def _keep_acronyms(query: str, keywords: str) -> str:
-    pattern = _ACRONYM_KO if LLMClient.detect_language(query) == "ko" else _ACRONYM_EN
+    is_ko = LLMClient.detect_language(query) == "ko"
+    pattern = _ACRONYM_KO if is_ko else _ACRONYM_EN
     kw_lower = keywords.lower()
     missing = [a for a in dict.fromkeys(pattern.findall(query))
                if a.lower() not in _ACRONYM_SKIP
                and not re.search(rf"\b{re.escape(a.lower())}\b", kw_lower)]
-    if not missing:
+    added = [f"{a.upper()} AI" for a in missing]
+    if is_ko:
+        added += [f"{en} AI" for ko, en in _KO_TERMS.items() if ko in query and en not in kw_lower]
+        added += [t for t in _english_terms(query) if t.lower() not in kw_lower
+                  and not any(t.lower() in a.lower() or a.lower() in t.lower() for a in added)]
+    if not added:
         return keywords
     phrases = [p.strip() for p in keywords.split("|") if p.strip()]
-    added = [f"{a.upper()} AI" for a in missing]
-    logger.info("키워드에서 사라진 약어 보존: %s", added)
+    logger.info("키워드에서 사라진 용어 보존: %s", added)
     return " | ".join((added + phrases)[:3])
 
 
@@ -128,6 +187,10 @@ _DEFINITION_INTENT = re.compile(
     r"|^\s*what\s+(?:is|are)\b|\bdefin(?:e|ition)\b|\bexplain\s+what\b",
     re.IGNORECASE,
 )
+# "RAG에 대해서 알려줘"도 개념 질문이다 (관찰: 개념 설명 대신 RAG 암호화 응용 논문이 뽑힘).
+# 단, "RAG 최신 연구에 대해 알려줘"처럼 최신·동향을 묻는 질문은 제외한다.
+_ABOUT_INTENT = re.compile(r"에\s*대(?:해|하여)\s*(?:서\s*)?(?:알려|설명|소개)", re.IGNORECASE)
+_NOT_CONCEPT = re.compile(r"최신|최근|요즘|동향|트렌드|연구|논문|흐름")
 
 
 def _is_definition_intent(query: str) -> bool:
@@ -141,7 +204,8 @@ def _is_definition_intent(query: str) -> bool:
     """
     q = query.strip()
     if not _DEFINITION_INTENT.search(q):
-        return False
+        if not (_ABOUT_INTENT.search(q) and not _NOT_CONCEPT.search(q)):
+            return False
     if LLMClient.detect_language(q) == "ko":
         return len(re.findall(r"[가-힣]", q)) <= 12
     return len(q.split()) <= 6
@@ -193,15 +257,13 @@ _NEW_SEARCH_INTENT = re.compile(
 
 # "이 논문에서 실험 결과 찾아줘"처럼 지금 논문을 가리키면서 "찾아줘"를 쓰는 경우는
 # 후속 질문이다. 단, "이 논문 말고 다른 거"처럼 지금 논문을 밀어내는 표현이면 새 검색.
-_CURRENT_PAPER_REF = ("이 논문", "이논문", "방금", "앞서", "this paper", "the paper")
 _EXCLUDE_CURRENT = re.compile(r"말고|대신|외에|빼고|\binstead\b|\bother\s+than\b", re.IGNORECASE)
 
 
 def _is_new_search_intent(query: str) -> bool:
     if not _NEW_SEARCH_INTENT.search(query):
         return False
-    refers_current = any(k in query.lower() for k in _CURRENT_PAPER_REF)
-    return not refers_current or bool(_EXCLUDE_CURRENT.search(query))
+    return not _REFERS_CURRENT.search(query) or bool(_EXCLUDE_CURRENT.search(query))
 
 
 # 최신 의도 — S2의 날짜 정렬(sort=publicationDate)은 검색 API에서 무시되어
@@ -227,8 +289,32 @@ def _wants_newest(query: str) -> bool:
     return bool(_NEWEST_INTENT.search(query))
 
 
+# 연도를 직접 적은 질문 — "2026년 이후 논문"을 최신 의도로도 못 잡아 연도 제한 없이 검색했고,
+# LLM은 '이후'를 "Future AI applications"로 옮겨 2005년 산림 논문까지 후보에 들어옴(관찰).
+_YEAR = r"((?:19|20)\d{2})"
+_YEAR_FROM = re.compile(rf"{_YEAR}\s*년?\s*(?:이후|부터|이래|이상)|\b(?:since|from)\s+{_YEAR}\b", re.IGNORECASE)
+_YEAR_AFTER = re.compile(rf"\bafter\s+{_YEAR}\b", re.IGNORECASE)
+_YEAR_UNTIL = re.compile(rf"{_YEAR}\s*년?\s*(?:이전|까지)|\b(?:before|until)\s+{_YEAR}\b", re.IGNORECASE)
+_YEAR_IN = re.compile(rf"{_YEAR}\s*년|\bin\s+{_YEAR}\b", re.IGNORECASE)
+
+
+def _explicit_year(query: str) -> Optional[str]:
+    """질문에 적힌 연도를 S2 연도 필터로 — "2026년 이후" → "2026-", "2020년 이전" → "-2020", "2024년" → "2024"."""
+    if m := _YEAR_FROM.search(query):
+        return f"{m.group(1) or m.group(2)}-"
+    if m := _YEAR_AFTER.search(query):
+        return f"{int(m.group(1)) + 1}-"
+    if m := _YEAR_UNTIL.search(query):
+        return f"-{m.group(1) or m.group(2)}"
+    if m := _YEAR_IN.search(query):
+        return m.group(1) or m.group(2)
+    return None
+
+
 def _recency_year(query: str) -> Optional[str]:
-    """최신 의도면 S2 연도 필터 문자열("2025-")을, 아니면 None을 돌려준다."""
+    """연도 필터 문자열("2025-")을, 없으면 None. 질문에 적힌 연도가 '최신'보다 우선."""
+    if year := _explicit_year(query):
+        return year
     if not _RECENCY_INTENT.search(query):
         return None
     this_year = date.today().year
@@ -241,6 +327,15 @@ def _relax_year(year: str) -> Optional[str]:
     return f"{this_year - 1}-" if year == f"{this_year}-" else None
 
 
+def year_label(year: str) -> str:
+    """화면 안내용 — "2026-" → "2026년 이후", "-2020" → "2020년 이전", "2024" → "2024년"."""
+    if year.endswith("-"):
+        return f"{year[:-1]}년 이후"
+    if year.startswith("-"):
+        return f"{year[1:]}년 이전"
+    return f"{year}년"
+
+
 # 최신 의도일 때 검색어에서 뺄 시기 표현. 연도 필터가 이미 "최신"을 맡는데 LLM이
 # 같은 뜻을 단어로도 넣어서, 제목에 "Advancements", "Cutting-edge"가 들어간
 # 논문(분야 무관한 화학·마케팅 논문 포함)이 후보를 채웠다(관찰).
@@ -249,7 +344,8 @@ def _relax_year(year: str) -> Optional[str]:
 # "drug development"처럼 주제어일 수 있어 복수형만 뺀다.
 _RECENCY_WORDS = re.compile(
     r"\b(?:latest|recent|newest|cutting[- ]edge|state[- ]of[- ]the[- ]art|emerging|contemporary"
-    r"|advancements?|advances|breakthroughs?|developments|innovations)\b",
+    r"|advancements?|advances|breakthroughs?|developments|innovations"
+    r"|(?:19|20)\d{2}s?|future|after|since|onwards?)\b",   # 연도 필터가 맡는 연도·'이후' 표현
     re.IGNORECASE,
 )
 
@@ -317,6 +413,98 @@ def _is_vague_query(query: str) -> bool:
     return False
 
 
+# 주제 없는 질문 — "최신 연구동향 알려줘"처럼 분야가 빠지면 LLM이 검색어를
+# "research trends | methodologies"로 만들어 파킨슨병·식물 질병 논문이 뽑혔다(관찰).
+# 일반적인 말(최신·연구·동향·논문·알려줘…)과 조사를 빼고 남는 내용이 없으면 주제를 되묻는다.
+_GENERIC_WORDS = sorted([
+    "최신", "최근", "요즘", "요새", "가장", "제일", "새로운", "새로", "나온", "발표된", "연구", "동향",
+    "트렌드", "흐름", "논문", "자료", "분야", "주제", "관련된", "관련", "에대해서", "에대해", "대한",
+    "알려주세요", "알려줘", "알려", "찾아주세요", "찾아줘", "찾아", "보여줘", "정리해줘", "정리",
+    "요약해줘", "요약", "설명해줘", "설명", "뭐야", "뭐가", "있어", "있나요", "무엇", "어떤", "해줘",
+    "주세요", "좀", "더", "latest", "recent", "new", "research", "trends", "trend", "papers", "paper",
+    "find", "show", "me", "tell", "about", "the", "a", "on", "in", "what", "are", "is", "any",
+], key=len, reverse=True)
+_PARTICLES = set("은는이가을를의에도와과로서")
+
+
+def _is_topicless_query(query: str) -> bool:
+    q = re.sub(r"[\s?!.,~]", "", query.lower())
+    if not q:
+        return False
+    for w in _GENERIC_WORDS:
+        q = q.replace(w, "")
+    return all(ch in _PARTICLES for ch in q)
+
+
+# "이 논문", "방금" 처럼 지금 읽은 논문을 가리키는 질문 — 읽은 논문이 없으면 검색하지 않고 안내한다
+# (관찰: 첫 질문으로 "이 논문 요약해줘" → "Paper Summary Attack" 같은 엉뚱한 논문을 검색)
+_REFERS_CURRENT = re.compile(r"이\s*논문|해당\s*논문|방금|앞서|앞의\s*논문|this paper", re.IGNORECASE)
+
+# 한계 질문 — 원문의 한계·향후 연구 문단을 우선 찾고, 저자가 밝힌 한계만 답하게 한다
+# (관찰: "이 논문의 한계는?"에 원문에 없는 평가 문장을 지어 답함)
+_LIMIT_INTENT = re.compile(r"한계점?|단점|약점|제약|limitations?|weakness(?:es)?|drawbacks?|shortcomings?", re.IGNORECASE)
+
+
+def _is_own_limit_question(query: str) -> bool:
+    """지금 논문의 한계를 묻는가 — "이 논문의 한계는?", "한계는?"은 예, "RAG의 한계를 다룬 논문"은 아니오."""
+    if not _LIMIT_INTENT.search(query):
+        return False
+    rest = _LIMIT_INTENT.sub("", query)
+    return (bool(_REFERS_CURRENT.search(query)) or not re.sub(r"[\s?!.,~]", "", rest)
+            or _is_topicless_query(rest))
+
+
+# 원문에서 한계·향후 과제를 말하는 표현 — 자기 연구를 가리키는 표현만 센다.
+# 그냥 'limitations'는 배경 설명("기존 방법은 한계가 있다")에도 흔해서 뺐다(10편 시험: 대부분 배경 문장).
+# PDF 글은 단어 사이에 줄바꿈이 끼므로 공백 자리는 \s+로 둔다.
+_LIMIT_TEXT = re.compile(
+    r"\bfuture\s+(?:work|research|directions?)\b|\bin\s+(?:the\s+)?future\b|\bwe\s+leave\b"
+    r"|\b(?:a|one|another|the|main|key|major)\s+limitations?\s+of\s+(?:our|this|the\s+proposed)\b"
+    r"|\blimitations?\s+of\s+(?:our|this)\s+(?:work|study|paper|approach|method)\b"
+    r"|\b(?:our|this|the\s+proposed)\s+(?:approach|method|model|work|study|paper|framework|system)s?\s+"
+    r"(?:has|have|is|are)\s+(?:also\s+)?(?:limited|several\s+limitations|some\s+limitations|limitations|a\s+limitation)\b",
+    re.IGNORECASE)
+# 'Limitations' / 'Future work' 절 제목 — 가산점
+# 번호 붙은 제목 안에 있어도 잡는다 ("7. Challenges, Security, and Future Research Directions")
+_LIMIT_HEADING = re.compile(
+    r"(?:^|\n)\s*(?:\d+(?:\.\d+)*\.?\s*)?(?:limitations?|future\s+work)\b"
+    r"|(?:^|\n)\s*\d+(?:\.\d+)*\.?\s+[^\n]{0,80}?\b(?:limitations?|future\s+(?:work|research|directions?))\b",
+    re.IGNORECASE)
+# 요약의 한계 줄 — 모델이 쓰지 않고 고정 문장을 붙인다(llm_client의 요약 프롬프트 설명 참고)
+SUMMARY_LIMIT_KO = "- 한계: 논문 앞부분에는 명시되어 있지 않습니다. 아래 '한계' 버튼으로 원문의 한계 문단을 찾아볼 수 있습니다."
+SUMMARY_LIMIT_EN = "- Limitations: Not stated in the opening sections. Use the 'Limitations' button below to search the full text."
+_NO_LIMIT_KO = "근거 문단에서 저자가 밝힌 한계를 찾지 못했습니다. 이 논문은 한계나 향후 과제를 따로 적지 않은 것으로 보입니다."
+_NO_LIMIT_EN = "No author-stated limitations or future work were found in this paper's text."
+
+
+def _retrieval_text(query: str) -> str:
+    if _LIMIT_INTENT.search(query):
+        return f"{query} limitations limitation future work challenges open problems"
+    return query
+
+
+# 동향 질문 — 논문을 고를 때 분야 종합 논문을 우선한다
+_TREND_INTENT = re.compile(r"동향|트렌드|추세|\btrends?\b|\blandscape\b", re.IGNORECASE)
+# 검색 조건 표현 — 검색이 이미 처리했으므로 답변 모델에는 넘기지 않는다
+# (관찰: "2026년 이후 ai 연구 동향" → 답변이 "이 논문은 2026년 이후 디지털 학습 분야에서…")
+_YEAR_CONDITION = re.compile(
+    rf"{_YEAR_FROM.pattern}|{_YEAR_AFTER.pattern}|{_YEAR_UNTIL.pattern}|{_YEAR_IN.pattern}", re.IGNORECASE)
+_SEARCH_CONDITION = re.compile(
+    rf"{_YEAR_CONDITION.pattern}"
+    r"|(?:가장|제일)?\s*(?:최신|최근|요즘|요새)(?:의|에)?(?:\s*나온)?", re.IGNORECASE)
+
+
+def _answer_query(query: str, lang: str) -> str:
+    query = " ".join(_SEARCH_CONDITION.sub(" ", query).split()) or query
+    if not _LIMIT_INTENT.search(query):
+        return query
+    if lang == "ko":
+        return (f"{query}\n(논문 저자가 직접 밝힌 한계만 답하십시오. <연구_문맥>에 저자가 밝힌 한계나 향후 과제가 "
+                "없으면 '근거 문단에서 저자가 밝힌 한계를 찾지 못했습니다.'라고만 답하고, 추측하거나 논문을 평가하지 마십시오.)")
+    return (f"{query}\n(Report only limitations the authors themselves state. If <retrieved_context> states none, "
+            "answer only 'No author-stated limitations were found in the retrieved passages.' Do not speculate.)")
+
+
 # 수치 의미 검사 — 답변이 "기존 대비 21.2% 향상"이라고 썼는데 원문의 21.2%는
 # "top-1 error 21.2%"처럼 지표 값 자체인 경우(관찰: Inception 논문, 같은 질문 4번 모두).
 # 프롬프트 규칙과 숫자 옆 표시를 모두 시험했지만 2.4B 모델은 "gains over the state of
@@ -355,6 +543,27 @@ def _metric_misreads(answer: str, context: str) -> List[Tuple[str, str]]:
                 found.append((n, " ".join(sent.split())[:220]))
                 break
     return found
+
+
+def _uploaded_title(pdf_path: str) -> str:
+    """업로드 PDF의 제목 — PDF 메타데이터, 없으면 첫 쪽에서 가장 큰 글씨 줄."""
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        meta = (doc.metadata or {}).get("title", "").strip()
+        if len(meta) > 8 and not meta.lower().endswith((".pdf", ".docx", ".tex")):
+            return meta
+        best, size = "", 0.0
+        for block in doc[0].get_text("dict")["blocks"]:
+            for line in block.get("lines", []):
+                text = " ".join(sp["text"] for sp in line["spans"]).strip()
+                fs = max((sp["size"] for sp in line["spans"]), default=0)
+                if len(text) > 8 and fs > size:
+                    best, size = text, fs
+        return best[:150]
+    except Exception as exc:
+        logger.warning("업로드 PDF 제목 추출 실패: %s", exc)
+        return ""
 
 
 def _is_summary_intent(query: str) -> bool:
@@ -539,7 +748,10 @@ class RAGPipeline:
         제거, 사라진 약어 복원, 정의 질문이면 survey 검색어 추가. 결과는
         _last_keywords에 남겨 두었다가 index_paper가 BM25용 키워드로 넘겨받는다.
         """
-        keywords = self._llm.refine_query(user_query)
+        # 연도 조건은 연도 필터가 맡는다 — LLM에 넘기면 "이후"를 "Post- Technological" 같은
+        # 검색어로 옮긴다(관찰). 연도 표현만 뺀다. "최신"까지 빼면 "RAG 최신 연구 동향"의 검색어가
+        # 바뀌어 체계적 리뷰를 놓쳤다(원본 비교).
+        keywords = self._llm.refine_query(" ".join(_YEAR_CONDITION.sub(" ", user_query).split()) or user_query)
         self.search_year = _recency_year(user_query)
         self.wants_newest = _wants_newest(user_query) and self.search_year is not None
         if self.search_year:
@@ -717,10 +929,11 @@ class RAGPipeline:
         if prefer_recent:
             # 날짜순으로 보여줘야 작은 모델이 날짜를 비교하기 쉽다. 원래 목록은 건드리지 않는다.
             papers = sorted(papers, key=lambda p: p.get("published") or "", reverse=True)
+        trend = bool(_TREND_INTENT.search(query))
         return self._llm.select_best_paper(
             query, papers,
-            prefer_overview=_is_definition_intent(query),
-            prefer_recent=prefer_recent,
+            prefer_overview=_is_definition_intent(query) or trend,
+            prefer_recent=prefer_recent, trend=trend,
         )
 
     def candidates_for_display(self, papers: List[Dict]) -> List[Dict]:
@@ -749,6 +962,23 @@ class RAGPipeline:
     def is_vague_query(query: str) -> bool:
         """한 단어뿐이라 검색 전에 무엇이 궁금한지 되물어야 하는 질문인가."""
         return _is_vague_query(query)
+
+    @staticmethod
+    def is_topicless_query(query: str) -> bool:
+        """'최신 연구동향 알려줘'처럼 주제(분야)가 빠진 질문인가."""
+        return _is_topicless_query(query)
+
+    @staticmethod
+    def refers_to_current_paper(query: str) -> bool:
+        """'이 논문', '방금'처럼 지금 읽은 논문을 가리키는 질문인가."""
+        return bool(_REFERS_CURRENT.search(query))
+
+    @staticmethod
+    def topic_options(query: str, lang: str) -> List[Tuple[str, str]]:
+        """주제를 되물을 때의 선택지 — 원래 질문 앞에 분야를 붙인다."""
+        q = query.strip()
+        topics = ("인공지능(AI)", "대규모 언어 모델(LLM)", "RAG") if lang == "ko" else ("AI", "LLM", "RAG")
+        return [(t, f"{t.split('(')[0]} {q}") for t in topics]
 
     @staticmethod
     def clarify_options(query: str, lang: str) -> List[Tuple[str, str]]:
@@ -796,6 +1026,32 @@ class RAGPipeline:
             logger.error("Could not download PDF for %s", paper["id"])
             return 0
 
+        return self._index_pdf(paper, pdf_path)
+
+    def index_uploaded_pdf(self, data: bytes, filename: str) -> Tuple[Dict, int]:
+        """
+        사용자가 올린 PDF를 현재 논문으로 인덱싱한다(계획서의 '논문 업로드' 기능).
+        검색·다운로드를 건너뛰고, 이후 질문은 이 논문에 대해 답한다.
+        """
+        digest = hashlib.sha1(data).hexdigest()[:12]
+        folder = os.path.join(".", "pdfs", "uploads")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"{digest}.pdf")
+        with open(path, "wb") as fh:
+            fh.write(data)
+        title = _uploaded_title(path) or os.path.splitext(filename)[0]
+        paper = {
+            "id": f"upload_{digest}", "title": title, "authors": [], "published": "",
+            "url": "", "abstract": "", "uploaded": True, "filename": filename,
+        }
+        self._store.reset()
+        self._current_paper = paper
+        self._paper_keywords = None
+        self._last_keywords = None
+        return paper, self._index_pdf(paper, path)
+
+    def _index_pdf(self, paper: Dict, pdf_path: str) -> int:
+        """PDF 파일 하나를 추출·분할·임베딩해 인덱스에 넣는다(검색 논문·업로드 공용)."""
         full_text = extract_pdf_text(pdf_path)
 
         # Cheap non-LLM sanity check: does the paper's own title actually appear
@@ -803,7 +1059,7 @@ class RAGPipeline:
         # beyond the arXiv-ID/year heuristic in semantic_scholar_tool.py. This is a
         # WARNING signal only (PDF layout/OCR can cause false negatives) — it does
         # not block indexing.
-        if full_text:
+        if full_text and not paper.get("uploaded"):
             title_words = [w.lower() for w in re.findall(r"\w+", paper["title"]) if len(w) > 3][:6]
             if title_words:
                 head = full_text[:3000].lower()
@@ -864,7 +1120,7 @@ class RAGPipeline:
         self,
         papers: List[Dict],
         selected: Dict,
-        max_attempts: int = 3,
+        max_attempts: int = 5,   # 다운로드를 막는 사이트가 많다 — 3편 모두 실패한 사례(관찰)
         query: str = "",
     ) -> Tuple[Optional[Dict], int, bool]:
         """
@@ -935,8 +1191,14 @@ class RAGPipeline:
         Returns:
             (thinking, answer) — thinking is "" with the XML-prompt format.
         """
-        query_vec = self._embedder.embed_query(query)
-        context_chunks = self._retrieve(query, query_vec)
+        if _is_own_limit_question(query):
+            context_chunks = self._limitation_chunks()
+            if not context_chunks:
+                self._remember_context([], paper)
+                return "", (_NO_LIMIT_KO if lang == "ko" else _NO_LIMIT_EN)
+        else:
+            query_vec = self._embedder.embed_query(_retrieval_text(query))
+            context_chunks = self._retrieve(_retrieval_text(query), query_vec)
 
         if not context_chunks:
             err = (
@@ -947,9 +1209,12 @@ class RAGPipeline:
             return "", err
 
         self._remember_context(context_chunks, paper)
+        summary = _is_summary_intent(query)
         thinking, answer = self._llm.generate_rag_response(
-            query, context_chunks, paper, lang
+            _answer_query(query, lang), context_chunks, paper, lang, summary=summary
         )
+        if summary and answer.strip():
+            answer = answer.rstrip() + "\n" + (SUMMARY_LIMIT_KO if lang == "ko" else SUMMARY_LIMIT_EN)
 
         if not answer.strip():
             logger.warning(
@@ -1008,8 +1273,17 @@ class RAGPipeline:
         3-tier fallback chain itself — app.py calls generate_answer as the
         fallback if the stream produces no usable text.
         """
-        query_vec = self._embedder.embed_query(query)
-        context_chunks = self._retrieve(query, query_vec)
+        if _is_own_limit_question(query):
+            # 한계 질문 — 원문에서 한계·향후 과제 문단을 직접 찾는다. 없으면 모델에 묻지 않는다
+            # (관찰: 2.4B 모델이 '저자가 밝힌 한계만' 지시를 어기고 기존 연구의 문제를 한계로 답함)
+            context_chunks = self._limitation_chunks()
+            if not context_chunks:
+                self._remember_context([], paper)
+                yield _NO_LIMIT_KO if lang == "ko" else _NO_LIMIT_EN
+                return
+        else:
+            query_vec = self._embedder.embed_query(_retrieval_text(query))
+            context_chunks = self._retrieve(_retrieval_text(query), query_vec)
         if not context_chunks:
             yield (
                 "검색된 컨텍스트가 없습니다. 다른 질문을 시도해 주세요."
@@ -1018,10 +1292,25 @@ class RAGPipeline:
             )
             return
         self._remember_context(context_chunks, paper)
-        yield from self._llm.stream_rag_response(query, context_chunks, paper, lang)
+        summary = _is_summary_intent(query)
+        wrote = False
+        for piece in self._llm.stream_rag_response(
+            _answer_query(query, lang), context_chunks, paper, lang, summary=summary
+        ):
+            wrote = wrote or bool(piece.strip())
+            yield piece
+        if summary and wrote:
+            yield "\n" + (SUMMARY_LIMIT_KO if lang == "ko" else SUMMARY_LIMIT_EN)
+
+    def _limitation_chunks(self) -> List[Dict]:
+        """원문에서 한계·향후 과제를 말하는 청크 (Limitations 절 우선, 최대 3개)."""
+        chunks = self._store.keyword_chunks(_LIMIT_TEXT, 3, bonus=_LIMIT_HEADING)
+        logger.info("한계 질문 — 한계·향후 과제 문단 %d개", len(chunks))
+        return chunks
 
     def _remember_context(self, context_chunks: List[Dict], paper: Dict) -> None:
-        """답변에 쓴 근거(초록 + 문단)를 남겨 둔다 — 답변 뒤 수치 검사용."""
+        """답변에 쓴 근거(초록 + 문단)를 남겨 둔다 — 답변 뒤 수치 검사와 '근거 문단 보기'용."""
+        self.last_evidence = list(context_chunks)
         self._last_context = "\n".join(
             [paper.get("abstract") or ""] + [c["chunk"] for c in context_chunks]
         )
@@ -1061,9 +1350,11 @@ class RAGPipeline:
         chunks = self._store.search(
             query_vec,
             query_text=self._bm25_text(query),
-            top_k=TOP_K,
+            top_k=_top_k_for(query),
             candidate_k=CANDIDATE_K,
         )
+        # 목차 청크 제외 (관찰: "LLM의 한계는?"에 목차의 장 제목들이 근거로 뽑힘). 전부 목차면 그대로
+        chunks = [c for c in chunks if not VectorStore._is_toc(c["chunk"])] or chunks
         return self._compress_context(query_vec, chunks)
 
     def _bm25_text(self, query: str) -> str:
@@ -1084,7 +1375,7 @@ class RAGPipeline:
         self,
         query_vec: np.ndarray,
         chunks: List[Dict],
-        max_sents: int = 3,
+        max_sents: int = 2,   # 온전한 문장을 쓰게 된 뒤 3개면 근거가 원본의 1.5~2배라 느렸다(원본 비교)
         threshold: float = 0.30,
     ) -> List[Dict]:
         """
@@ -1097,11 +1388,7 @@ class RAGPipeline:
         before = sum(len(c["chunk"]) for c in chunks)
         out = []
         for c in chunks:
-            sents = [
-                s.strip()
-                for s in _SENT.split(c["chunk"])
-                if len(s.strip()) > 15
-            ]
+            sents = _sentences(c["chunk"])
             if not sents:
                 out.append(c)
                 continue

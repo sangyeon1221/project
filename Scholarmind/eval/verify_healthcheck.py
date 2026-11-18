@@ -12,6 +12,7 @@ FAIL이 나오는지 확인한다. 고장을 냈는데 PASS가 나오면 그 체
 
 import importlib.util
 import os
+os.environ.setdefault("S2_SEARCH_CACHE", "0")   # 검색 결과 저장본 끄기
 import shutil
 import sys
 import tempfile

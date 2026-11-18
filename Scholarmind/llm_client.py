@@ -199,6 +199,16 @@ _OVERVIEW_HINT_EN = (
     "concept, prefer it. A paper that explains the concept itself fits better than one "
     "that applies it to a specific domain.\n"
 )
+# 동향 질문용 — "AI 연구 동향"에 분야 종합 논문 대신 디지털 학습 설문 연구가 뽑힘(관찰)
+_TREND_HINT_KO = (
+    "\n이 질문은 한 분야 전체의 연구 동향을 묻고 있습니다. 후보 중 [개요 논문] 표시가 붙은 논문이 "
+    "질문의 분야 전체를 다룬다면 그 논문을 우선 고르십시오. 특정 응용 분야 하나만 다루는 논문보다 "
+    "분야 전체의 흐름을 정리한 논문이 더 적합합니다.\n"
+)
+_TREND_HINT_EN = (
+    "\nThis question asks about research trends across a whole field. If a candidate marked [Overview] "
+    "covers the whole field, prefer it over a paper about one application area.\n"
+)
 # "제일 최신 논문" 질문용. 후보에 날짜를 보여주고 날짜순으로 정렬해서 넘긴다.
 # 날짜만 보고 주제와 무관한 논문을 고르지 않도록 "관련 있는 것 중"을 명시한다.
 _RECENT_HINT_KO = (
@@ -220,7 +230,7 @@ _OVERVIEW_TITLE = re.compile(
     r"(?:survey|review|overview)\b"
     r"|\b(?:survey|review|overview)\s+(?:of|on)\b"
     r"|:\s*(?:a\s+|an\s+)?(?:survey|review|overview|tutorial|primer)\b"
-    r"|\btutorial\b|\bintroduction to\b|\bprimer\b|\btaxonomy\b",
+    r"|\btutorial\b|\bintroduction to\b|\bprimer\b|\btaxonomy\b|\bsynthesis\b",
     re.IGNORECASE,
 )
 
@@ -297,6 +307,53 @@ _RAG_PROMPT_KO = """\
 {context}
 </연구_문맥>
 [최종 답변]:"""
+
+
+# ── 요약 프롬프트 — 계획서의 구조화 출력(핵심 아이디어 / 방법 / 결과 / 한계) ──
+# 모델은 앞 세 줄만 쓴다. 요약은 문서 앞부분(제목·초록·서론)만 읽어서 한계가 거의 없고,
+# 한계 줄까지 쓰게 하면 추측을 덧붙이며 답이 2배로 길어졌다(원본 비교: 12.6초 → 25초).
+# 한계 줄은 rag_pipeline이 고정 문장(SUMMARY_LIMIT_*)으로 붙인다.
+
+# 요약 출력 길이 상한(토큰) — 짧게 쓰라는 지시를 2.4B 모델이 자주 어겨 요약이 원본의 2배로
+# 느렸다(12.6초 → 22초). 잘린 마지막 문장은 app의 요약 정리(_trim_summary)가 뺀다.
+SUMMARY_MAX_TOKENS: int = 280
+
+_SUMMARY_PROMPT_KO = """당신은 공학 논문을 분석하는 전문 연구원입니다. 아래 <연구_문맥>은 논문의 앞부분(제목·초록·서론)입니다. 이 내용만 근거로 논문을 한국어로 요약하십시오.
+
+작성 규칙:
+- 아래 출력 형식의 세 줄을 정확히 따르십시오. 각 줄은 '- 항목이름: '으로 시작하고, 한 문장(80자 안팎)으로만 쓰십시오. 문장은 '~합니다' 체로 끝내십시오.
+- <연구_문맥>에 없는 내용은 지어내지 마십시오. 세 줄 외에 다른 줄(한계 등)은 쓰지 마십시오.
+- 수치는 <연구_문맥>에 적힌 의미 그대로 옮기십시오.
+- 약어의 뜻을 추측해서 풀어 쓰지 마십시오.
+
+출력 형식 (이 형식을 정확히 따르십시오):
+- 핵심 아이디어: 이 논문이 해결하려는 문제와 제안하는 내용
+- 방법: 사용한 기법이나 접근 방식
+- 결과: 실험이나 평가에서 보인 결과
+
+<사용자_질문>{query}</사용자_질문>
+<연구_문맥>
+{context}
+</연구_문맥>
+[최종 답변]:"""
+
+_SUMMARY_PROMPT_EN = """<system_instruction>
+Role: CS research assistant.
+Task: Summarize the paper using ONLY <retrieved_context>, which is the beginning of the paper (title, abstract, introduction).
+Rules:
+- Follow the three-line output format exactly; each line ONE sentence. Write no other lines.
+- Never invent facts.
+- Keep numbers with their original meaning. Never guess what an acronym stands for.
+Output format:
+- Key idea: the problem and what the paper proposes
+- Method: the technique or approach
+- Results: what the experiments or evaluation show
+</system_instruction>
+<user_query>{query}</user_query>
+<retrieved_context source="{title}" year="{year}">
+{context}
+</retrieved_context>
+[Final Answer]:"""
 
 
 # ── Simplified fallback prompts ───────────────────────────────────────────────
@@ -397,6 +454,10 @@ class LLMClient:
         """Return 'ko' if text contains Hangul, 'en' otherwise."""
         if re.search(r"[가-힣ᄀ-ᇿ㄰-㆏]", text):
             return "ko"
+        # 한 단어("claude", "RAG")는 언어를 알 수 없다 — 한국어 앱이므로 한국어로 본다
+        # (관찰: "claude" 하나에 영어로 되묻고 영어 선택지를 보여줌)
+        if len(text.split()) <= 1:
+            return "ko"
         return "en"
 
     # ------------------------------------------------------------------
@@ -430,7 +491,7 @@ class LLMClient:
 
     def select_best_paper(
         self, query: str, papers: List[Dict], prefer_overview: bool = False,
-        prefer_recent: bool = False,
+        prefer_recent: bool = False, trend: bool = False,
     ) -> Tuple[Dict, str]:
         """
         Autonomously choose the most relevant paper from *papers*.
@@ -455,7 +516,10 @@ class LLMClient:
             prefer_overview = False
         if prefer_overview:
             label = "[개요 논문]" if lang == "ko" else "[Overview]"
-            hint = _OVERVIEW_HINT_KO if lang == "ko" else _OVERVIEW_HINT_EN
+            if trend:
+                hint = _TREND_HINT_KO if lang == "ko" else _TREND_HINT_EN
+            else:
+                hint = _OVERVIEW_HINT_KO if lang == "ko" else _OVERVIEW_HINT_EN
         if prefer_recent:
             hint += _RECENT_HINT_KO if lang == "ko" else _RECENT_HINT_EN
         papers_block = self._format_papers_for_selection(
@@ -513,6 +577,7 @@ class LLMClient:
         context_chunks: List[Dict],
         paper: Dict,
         lang: str,
+        summary: bool = False,
     ) -> Tuple[str, str]:
         """
         Generate the final answer using the language-appropriate prompt
@@ -528,9 +593,9 @@ class LLMClient:
         Returns:
             ("", answer) — 첫 값은 예전 Thinking/Answer 형식의 흔적으로 항상 빈 문자열.
         """
-        prompt = self._rag_prompt(query, context_chunks, paper, lang)
+        prompt = self._rag_prompt(query, context_chunks, paper, lang, summary)
         raw = self._generate_sync(
-            prompt,
+            prompt, num_predict=SUMMARY_MAX_TOKENS if summary else None,
             temperature=0.1,
             repeat_penalty=1.0,
             top_p=0.9,
@@ -539,9 +604,13 @@ class LLMClient:
         return "", answer
 
     @staticmethod
-    def _rag_prompt(query: str, context_chunks: List[Dict], paper: Dict, lang: str) -> str:
-        """일반·스트리밍 답변이 같은 프롬프트를 쓰도록 한 곳에서 만든다."""
-        template = _RAG_PROMPT_KO if lang == "ko" else _RAG_PROMPT_EN
+    def _rag_prompt(query: str, context_chunks: List[Dict], paper: Dict, lang: str,
+                    summary: bool = False) -> str:
+        """일반·스트리밍 답변이 같은 프롬프트를 쓰도록 한 곳에서 만든다. 요약 질의는 구조화 형식."""
+        if summary:
+            template = _SUMMARY_PROMPT_KO if lang == "ko" else _SUMMARY_PROMPT_EN
+        else:
+            template = _RAG_PROMPT_KO if lang == "ko" else _RAG_PROMPT_EN
         return template.format(
             query=query,
             title=paper["title"],
@@ -555,6 +624,7 @@ class LLMClient:
         context_chunks: List[Dict],
         paper: Dict,
         lang: str,
+        summary: bool = False,
     ) -> Iterator[str]:
         """
         Streaming counterpart to generate_rag_response. Builds the identical
@@ -563,8 +633,9 @@ class LLMClient:
         the caller cleans the assembled text once after streaming completes,
         matching generate_rag_response's existing post-processing.
         """
-        prompt = self._rag_prompt(query, context_chunks, paper, lang)
-        yield from self._generate_stream(prompt, temperature=0.1, repeat_penalty=1.0, top_p=0.9)
+        prompt = self._rag_prompt(query, context_chunks, paper, lang, summary)
+        yield from self._generate_stream(prompt, temperature=0.1, repeat_penalty=1.0, top_p=0.9,
+                                         num_predict=SUMMARY_MAX_TOKENS if summary else None)
 
     # ------------------------------------------------------------------
     # Simplified fallback when main RAG call returns empty
@@ -611,6 +682,7 @@ class LLMClient:
         temperature: Optional[float] = None,
         repeat_penalty: float = 1.0,
         top_p: float = 1.0,
+        num_predict: Optional[int] = None,
     ) -> str:
         """
         Non-streaming Ollama /api/chat call; returns the full response string.
@@ -639,6 +711,7 @@ class LLMClient:
             "num_thread": int(os.getenv("OLLAMA_NUM_THREAD", "0")),
             "stop": _STOP_EOS,
             **_gpu_option(),
+            **({"num_predict": num_predict} if num_predict else {}),
         }
         payload = {
             "model": self.model,
@@ -668,6 +741,7 @@ class LLMClient:
         temperature: Optional[float] = None,
         repeat_penalty: float = 1.0,
         top_p: float = 1.0,
+        num_predict: Optional[int] = None,
     ) -> Iterator[str]:
         """
         Streaming counterpart to _generate_sync — yields content pieces as Ollama
@@ -684,6 +758,7 @@ class LLMClient:
             "num_thread": int(os.getenv("OLLAMA_NUM_THREAD", "0")),
             "stop": _STOP_EOS,
             **_gpu_option(),
+            **({"num_predict": num_predict} if num_predict else {}),
         }
         payload = {
             "model": self.model,

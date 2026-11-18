@@ -26,6 +26,7 @@ healthcheck.py 와 목적이 다르다:
 
 import logging
 import os
+os.environ.setdefault("S2_SEARCH_CACHE", "0")   # 검색 결과 저장본 끄기
 import re
 import sys
 import time
